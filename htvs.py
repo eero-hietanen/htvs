@@ -3,6 +3,7 @@ from joblib import Parallel, delayed
 from rdkit import Chem
 from meeko import MoleculePreparation, PDBQTWriterLegacy
 from vina import Vina
+from openbabel import openbabel, pybel
 import os
 
 # START: Script params.
@@ -24,6 +25,9 @@ if not os.path.exists(output_directory):
 
 # Ligand library file in .sdf format.
 sdf_file = input_directory + "ligands_10.sdf"
+
+# Ligand library file in .smi format.
+smi_file = input_directory + "ligands_10_delim.smi"
 
 # Receptor file in .pdbqt format.
 # The receptor should be previously prepared with Meeko 'mk_prepare_receptor.py' (doesn't seem to be a Python API available, but could be done by calling it as a subprocess).
@@ -50,7 +54,7 @@ def molecule_prep(idx, mol):
         # Add explicit hydrogens and embed 3D coordinates.
         # NOTE: Maybe this preparation step needs an energy minimization step?
         mol = Chem.AddHs(mol)
-        Chem.rdDistGeom.EmbedMolecule(mol)
+        Chem.rdDistGeom.EmbedMolecule(mol) # This isn't needed when using the ligrep output from Maestro as it's already done the 3D conversion.
 
         # Prepare the ligand with Meeko.
         preparator = MoleculePreparation()
@@ -62,6 +66,26 @@ def molecule_prep(idx, mol):
         return idx, pdbqt_string, None  # No error.
     except Exception as e:
         return idx, None, str(e)  # Return error.
+    
+# Alternate molecule preparation function using Open Babel to account for protonation states.
+# Input is fixed to be the ligand library in .smi format.
+# Input molecules are in pybel molecule format.
+def molecule_prep2(idx, mol):
+    try:
+        # Convert the pybel molecule to Open Babel molecule.
+        obmol = mol.OBMol
+
+        # Add hydrogens and consider protonation states.
+        obmol.AddHydrogens(False, True, 7.4)
+
+        # Convert the Open Babel molecule back to pybel molecule.
+        mol = pybel.Molecule(obmol)
+
+        mol.make3D()
+
+        return idx, mol.write(format = "pdbqt")
+    except Exception as e:
+        return idx, None, str(e)
 
 # Docking function using Vina.
 # Uses Vina's own multiprocessing.
@@ -93,18 +117,23 @@ def process_batches(sdf_file, batch_size):
 
     # Initialize the moleculer supplier.
     suppl = Chem.SDMolSupplier(sdf_file) # SDMolSupplier is an iterator. There's also an experimental 'MultithreadedSDMolSupplier' that may be faster.
+    suppl2 = Chem.SmilesMolSupplier(smi_file, delimiter=",") # Iterator for the .smi ligand file.
+    #suppl2 = Chem.SmilesMolSupplierFromText(smi_file, delimiter=",") # This iterator might work better than the above one.
+    # NOTE: Suspicion is that the pybel.readfile() iterator causes the pickling issue with joblib.
+    #suppl2 = pybel.readfile("smi", smi_file) # Test pybel iterator for the ligand batching.
 
     batch = []
 
-    for idx, mol in enumerate(suppl):
+    for idx, mol in enumerate(suppl2): # Changed suppl -> suppl2
         if mol is not None:
             batch.append(mol)
 
         if len(batch) == batch_size:
 
+            # Changed molecule_prep -> molecule_prep2 and same below in the last batch.
             # Convert the ligands from the .sdf file to .pdbqt strings using Meeko.
             converted_batch = Parallel(n_jobs=n_cores_meeko)(
-                delayed(molecule_prep)(idx, mol) # Delayed call for molecule_prep() once below evaluation to done.
+                delayed(molecule_prep2)(idx, mol) # Delayed call for molecule_prep() once below evaluation to done.
                 for idx, mol in enumerate(batch)
                 if mol is not None
             )
@@ -118,23 +147,23 @@ def process_batches(sdf_file, batch_size):
     # Process the leftover ligands in the last batch.
     if batch:
         converted_batch = Parallel(n_jobs=n_cores_meeko)(
-                delayed(molecule_prep)(idx, mol) # Delayed call for molecule_prep() once below evaluation to done.
+                delayed(molecule_prep2)(idx, mol) # Delayed call for molecule_prep() once below evaluation to done.
                 for idx, mol in enumerate(batch)
                 if mol is not None
         )
         vina_results = dock_ligands_with_vina(vina_instance, receptor_file, docking_box, converted_batch)
-        db.add_results_from_vina_string(vina_results, finalize = False)
+        db.add_results_from_vina_string(vina_results, finalize = False) # Add the "add_interactions" param. here.
         batch.clear()
     
     # Save the receptor to the Ringtail database.
     if save_receptor_to_db:
-        db.save_receptor(receptor_file = receptor_file)
+        db.save_receptor(receptor_file = receptor_file) # This will cause an issue if the receptor is already saved to the db from a previous script execution.
     print("\nReceptor successfully saved to the database.")
     
     db.finalize_write()
 
 # Process all batches and add docking results to Ringtail database.
-process_batches(sdf_file, batch_size)
+process_batches(smi_file, batch_size)
 print("\nDocking results successfully added to the Ringtail database.")
 
 #NOTE: The Ringtail command line option to write sdf files is rt_process_vs read --input_db output.db --bookmark_name bookmark1 --export_sdf_path sdf_files/
