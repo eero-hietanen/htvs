@@ -35,7 +35,7 @@ smi_file_no_header = input_directory + "ligands_10_2.smi"
 
 # Receptor file in .pdbqt format.
 # The receptor should be previously prepared with Meeko 'mk_prepare_receptor.py' (doesn't seem to be a Python API available, but could be done by calling it as a subprocess).
-receptor_file = input_directory + "9f6a.pdbqt"
+receptor_file = input_directory + "9F6A_prepared.pdbqt"
 save_receptor_to_db = True
 
 # Docking box params for Vina.

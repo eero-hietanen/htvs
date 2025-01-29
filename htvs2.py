@@ -6,12 +6,14 @@ from vina import Vina
 import os
 from scrubber import Scrub
 from rdkit.Chem.MolStandardize import rdMolStandardize # Consider using rdMolStandardize to standardize the SMILES strings as it could affect the Scrubber step.
+import time
 
 # START: Script params.
 
 batch_size = 5  # Number of ligands per batch. Processing is done in batches as the ligand strings are held in memory during processing.
-n_cores_meeko = 18  # Core count for Meeko multiprocessing using joblib.
-n_cores_vina = 18 # Core count for Vina multiprocessing.
+n_cores_meeko = 12  # Core count for Meeko multiprocessing using joblib.
+n_cores_vina = 2 # Core (process) count for Vina multiprocessing.
+n_vina_threads = 8 # Number of threads to use per Vina instance (Vina's 'cpu' setting").
 vina_scoring_function = "vina" # Scoring function to use with Vina.
 
 # Data input directory holding ligand library and receptor.
@@ -27,8 +29,8 @@ smi_file = input_directory + "ligands_10_cxtest.cxsmiles"
 
 # Receptor file in .pdbqt format.
 # The receptor should be previously prepared with Meeko 'mk_prepare_receptor.py' (doesn't seem to be a Python API available, but could be done by calling it as a subprocess).
-receptor_file = input_directory + "9f6a.pdbqt"
-save_receptor_to_db = True
+receptor_file = input_directory + "9F6A_prepared.pdbqt"
+save_receptor_to_db = False
 
 # Docking box params for Vina.
 docking_box = {"center": [136.733, 172.819, 99.189], "box_size": [11.69, 7.09, 7.60]}
@@ -70,7 +72,7 @@ def molecule_prep(smiles, mol_name):
             # Scrubber handles protonation states, 3D coordinates, and tautomers. Will raise valance and kekulization exceptions quite often.
             for mol_index, mol_state in enumerate(scrub(mol)):
                 variant_mol_name = f"{mol_name}-{mol_index}" # TODO: See how to get the ligand variant docking to work without changing the name for each variant. Then see how Ringtail handles the duplicates.
-                # variant_mol_name = f"{mol_name}"
+                # variant_mol_name = f"{mol_name}" # If this is used then the docking result dictionary building breaks due to dictionary key collision.
 
                 # fragments = Chem.GetMolFrags(mol_state, asMols=True)
                 # if len(fragments) > 1:
@@ -98,16 +100,14 @@ def molecule_prep(smiles, mol_name):
         return []
 
 # Docking function for a single ligand using Vina
-def dock_single_ligand(receptor_file, docking_box, ligand_tuple):
-    # Create a new Vina instance for this process
-    v = Vina(sf_name = vina_scoring_function, cpu = 1, verbosity = 0)  # Use single core per instance
-    v.set_receptor(receptor_file)
-    v.compute_vina_maps(**docking_box)
-
-    idx, pdbqt_string = ligand_tuple
+def dock_single_ligand(receptor_file, docking_box, ligand):
+    idx, pdbqt_string = ligand
     try:
+        v = Vina(sf_name = vina_scoring_function, cpu = n_vina_threads, verbosity = 0)
+        v.set_receptor(receptor_file)
         v.set_ligand_from_string(pdbqt_string)
-        v.dock(exhaustiveness = 8, n_poses=5)
+        v.compute_vina_maps(**docking_box)
+        v.dock(exhaustiveness=8, n_poses=5)
         vina_poses = v.poses()
         return idx, vina_poses
     except Exception as e:
@@ -122,17 +122,19 @@ def dock_ligands_with_vina(receptor_file, docking_box, ligands):
         for ligand in ligands
     )
 
-    # Convert results to dictionary
+    # Convert results to dictionary. Ligand variant names are appended by a number for now.
+    """TODO: Building of this results dict is broken due to a key collision issue with same ligand names that are used as the dictionary key.
+    At the same time, Ringtail needs the dictionary to be in this format for result parsing.
+    """
     vina_output = {}
     for idx, poses in results:
         if poses is not None:
             vina_output[idx] = poses
-
     return vina_output
 
 # Function to handle batching of ligands.
 def process_batches(ligand_input_file, batch_size):
-
+    start_time = time.time()
     batch = []
     file_extension = os.path.splitext(ligand_input_file)[1].lower()
 
@@ -158,40 +160,55 @@ def process_batches(ligand_input_file, batch_size):
 
             # When the batch reaches the specified size, process it.
             if len(batch) == batch_size:
+                batch_start_time = time.time()
                 current_batch += 1
                 total_processed += len(batch)
                 print(f"\nProcessing batch {current_batch}/{total_batches} ({total_processed}/{total_lines} ligands processed)")
 
-                # Prepare molecules for docking using Scrubber and Meeko.
+                # Time the preparation step
+                prep_start = time.time()
                 converted_batch = Parallel(n_jobs=n_cores_meeko)(delayed(molecule_prep)(smiles, mol_name) for smiles, mol_name in batch)
-
-                # The converted_batch list is flattened as it is a list of lists, which is a result of generating the variants for each ligand.
                 flattened_batch = [variant for molecule_variants in converted_batch for variant in molecule_variants]
-                print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in batch {current_batch}")
+                prep_time = time.time() - prep_start
+                print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in batch {current_batch} ({prep_time:.2f}s)")
 
-                # Dock the converted batch of ligands using Vina.
-                # TODO: See if this can be parallelized using joblib.
+                # Time the docking step
+                dock_start = time.time()
                 vina_results = dock_ligands_with_vina(receptor_file, docking_box, flattened_batch)
-                print(f"Successfully docked {len(vina_results)} variants in batch {current_batch}")
-                db.add_results_from_vina_string(vina_results, finalize = False) # Add docking results to the Ringtail database.
-                batch.clear() # Clear the batch in preparation for the next batch.
-                converted_batch.clear() # Clear the converted batch in preparation for the next batch.
+                dock_time = time.time() - dock_start
+                print(f"Successfully docked {len(vina_results)} variants in batch {current_batch} ({dock_time:.2f}s)")
+
+                batch_time = time.time() - batch_start_time
+                avg_time_per_ligand = batch_time / len(batch)
+                print(f"Batch {current_batch} completed in {batch_time:.2f}s (avg {avg_time_per_ligand:.2f}s per ligand)")
+
+                db.add_results_from_vina_string(vina_results, finalize = False)
+                batch.clear()
+                converted_batch.clear()
 
     # Process the leftover ligands in the last batch.
     if batch:
+        batch_start_time = time.time()
         current_batch += 1
         total_processed += len(batch)
         print(f"\nProcessing final batch {current_batch}/{total_batches} ({total_processed}/{total_lines} ligands processed)")
 
+        prep_start = time.time()
         converted_batch = Parallel(n_jobs=n_cores_meeko)(
             delayed(molecule_prep)(smiles, mol_name) for smiles, mol_name in batch
         )
-
         flattened_batch = [variant for molecule_variants in converted_batch for variant in molecule_variants]
-        print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in final batch")
+        prep_time = time.time() - prep_start
+        print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in final batch ({prep_time:.2f}s)")
 
+        dock_start = time.time()
         vina_results = dock_ligands_with_vina(receptor_file, docking_box, flattened_batch)
-        print(f"Successfully docked {len(vina_results)} variants in final batch")
+        dock_time = time.time() - dock_start
+        print(f"Successfully docked {len(vina_results)} variants in final batch ({dock_time:.2f}s)")
+
+        batch_time = time.time() - batch_start_time
+        avg_time_per_ligand = batch_time / len(batch)
+        print(f"Final batch completed in {batch_time:.2f}s (avg {avg_time_per_ligand:.2f}s per ligand)")
         db.add_results_from_vina_string(vina_results, finalize = False) # Add the "add_interactions" param. here?
         batch.clear()
 
@@ -201,6 +218,10 @@ def process_batches(ligand_input_file, batch_size):
     print("\nReceptor successfully saved to the database.")
 
     db.finalize_write()
+
+    total_time = time.time() - start_time
+    print(f"\nTotal processing time: {total_time:.2f}s")
+    print(f"Average time per ligand: {total_time/total_lines:.2f}s")
 
 # Process all batches and add docking results to Ringtail database.
 process_batches(smi_file, batch_size)
