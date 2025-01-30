@@ -7,6 +7,9 @@ import os
 from scrubber import Scrub
 from rdkit.Chem.MolStandardize import rdMolStandardize # Consider using rdMolStandardize to standardize the SMILES strings as it could affect the Scrubber step.
 import time
+import subprocess
+import tempfile
+import re
 
 # START: Script params.
 
@@ -14,13 +17,18 @@ batch_size = 5  # Number of ligands per batch. Processing is done in batches as 
 n_cores_meeko = 12  # Core count for Meeko multiprocessing using joblib.
 n_cores_vina = 2 # Core (process) count for Vina multiprocessing.
 n_vina_threads = 8 # Number of threads to use per Vina instance (Vina's 'cpu' setting").
+qvina_gpu_threads = 8000
 vina_scoring_function = "vina" # Scoring function to use with Vina.
 
+# Path to QuickVina2-GPU binary and the OpenCL binaries.
+qvina_executable = "/home/fbsehi/tools/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1"
+opencl_binary_path = "/home/fbsehi/tools/Vina-GPU-2.1/QuickVina2-GPU-2.1"
+
 # Data input directory holding ligand library and receptor.
-input_directory = "Data/"
+input_directory = "./"
 
 # Output directory for the Ringtail database.
-output_directory = "Output/"
+output_directory = "htvs_qvina_output/"
 if not os.path.exists(output_directory):
     os.makedirs(output_directory)
 
@@ -49,6 +57,7 @@ def molecule_prep(smiles, mol_name):
     # Disabling rdkit's error output as the sanitization process often throws errors that can be ignored.
     # The error causing molecules should not be considered.
     rdBase.DisableLog('rdApp.error')
+    rdBase.DisableLog('rdApp.warning')
 
     # Set up Scrubber parameters. Variants are genereated for each ligand. The variant names are appended with an index number and all of them are directed to Vina for docking.
     scrub = Scrub(
@@ -98,12 +107,66 @@ def molecule_prep(smiles, mol_name):
             return []
 
         rdBase.EnableLog('rdApp.error') # Re-enabling error logging.
+        rdBase.EnableLog('rdApp.warning')
         return variants
 
     except Exception as e:
         print(f"Error processing molecule '{mol_name}': {str(e)}")
         rdBase.EnableLog('rdApp.error') # Re-enabling error logging.
+        rdBase.EnableLog('rdApp.warnings')
         return []
+
+# Docking function for a single ligand using QuickVina2-GPU as a process call.
+def dock_single_ligand_qvina(receptor_file, docking_box, ligand):
+    idx, pdbqt_string = ligand
+    temp_ligand_path = None
+
+    try:
+        # vina_path = os.path.expanduser("~/mambaforge/envs/ringtail/bin/vina")
+        # if not os.path.exists(vina_path):
+        #     raise FileNotFoundError(f"Vina executable not found at {vina_path}")
+            
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdbqt") as temp_ligand_file:
+            temp_ligand_file.write(pdbqt_string.encode())  # Write ligand content to temp file.
+            temp_ligand_path = temp_ligand_file.name  # Save temp file path
+
+        vina_cmd = f'{qvina_executable} --receptor {receptor_file} --ligand {temp_ligand_path} --thread {qvina_gpu_threads} --center_x {docking_box["center"][0]} --center_y {docking_box["center"][1]} --center_z {docking_box["center"][2]} --size_x {docking_box["size"][0]} --size_y {docking_box["size"][1]} --size_z {docking_box["size"][2]} --opencl_binary_path {opencl_binary_path} --out /dev/stdout'
+        # Local testing with regular Vina.
+        # vina_cmd = f'{vina_path} --receptor {receptor_file} --ligand {temp_ligand_path} --center_x {docking_box["center"][0]} --center_y {docking_box["center"][1]} --center_z {docking_box["center"][2]} --size_x {docking_box["box_size"][0]} --size_y {docking_box["box_size"][1]} --size_z {docking_box["box_size"][2]} --out /dev/stdout'
+
+        # Run QuickVina2-GPU
+        result = subprocess.check_output(vina_cmd, text=True, shell=True, stderr=subprocess.STDOUT)
+        filtered_output = re.findall(r'(?s)(MODEL \d+.*?ENDMDL)', result)
+        # Join multiple poses into single string to match regular Vina format
+        combined_poses = '\n'.join(filtered_output) if filtered_output else None
+        return idx, combined_poses
+    except subprocess.CalledProcessError as e:
+        print(f"Vina docking failed for {idx}: {e.output}")
+        return idx, None
+    except Exception as e:
+        print(f"Error in docking {idx}: {str(e)}")
+        return idx, None
+    finally:
+        if temp_ligand_path and os.path.exists(temp_ligand_path):
+            os.remove(temp_ligand_path)
+
+# Docking function using QuickVina2-GPU with joblib parallelization
+def dock_ligands_with_qvina(receptor_file, docking_box, ligands):
+    # Use joblib to parallelize the docking
+    results = Parallel(n_jobs=n_cores_vina)(
+        delayed(dock_single_ligand_qvina)(receptor_file, docking_box, ligand)
+        for ligand in ligands
+    )
+
+    # Convert results to dictionary. Ligand variant names are appended by a number for now.
+    """TODO: Building of this results dict is broken due to a key collision issue with same ligand names that are used as the dictionary key.
+    At the same time, Ringtail needs the dictionary to be in this format for result parsing.
+    """
+    vina_output = {}
+    for idx, poses in results:
+        if poses is not None:
+            vina_output[idx] = poses
+    return vina_output # NOTE: There is a discrepancy between this and the regular vina docking function output format which is causing the Ringtail parse error.
 
 # Docking function for a single ligand using Vina
 def dock_single_ligand(receptor_file, docking_box, ligand):
@@ -180,7 +243,7 @@ def process_batches(ligand_input_file, batch_size):
 
                 # Time the docking step
                 dock_start = time.time()
-                vina_results = dock_ligands_with_vina(receptor_file, docking_box, flattened_batch)
+                vina_results = dock_ligands_with_qvina(receptor_file, docking_box, flattened_batch) # Docking program spec
                 dock_time = time.time() - dock_start
                 print(f"Successfully docked {len(vina_results)} variants in batch {current_batch} ({dock_time:.2f}s)")
 
@@ -208,7 +271,7 @@ def process_batches(ligand_input_file, batch_size):
         print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in final batch ({prep_time:.2f}s)")
 
         dock_start = time.time()
-        vina_results = dock_ligands_with_vina(receptor_file, docking_box, flattened_batch)
+        vina_results = dock_ligands_with_qvina(receptor_file, docking_box, flattened_batch) # Docking program spec
         dock_time = time.time() - dock_start
         print(f"Successfully docked {len(vina_results)} variants in final batch ({dock_time:.2f}s)")
 
