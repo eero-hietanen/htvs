@@ -1,5 +1,27 @@
 #!/bin/bash
 
+"""Example of the batch file output format:
+ad4_receptor_input/9F6A_prepared_AD4.maps.fld
+ligands/000A-0084.pdbqt
+000A-0084
+ligands/000A-0138.pdbqt
+000A-0138
+ligands/000A-0221.pdbqt
+000A-0221
+ligands/000A-0480.pdbqt
+000A-0480
+ligands/000A-0676.pdbqt
+000A-0676
+ligands/000A-1031.pdbqt
+000A-1031
+ligands/0085-0007.pdbqt
+0085-0007
+ligands/0162-0041.pdbqt
+0162-0041
+ligands/0180-0433.pdbqt
+0180-0433
+"""
+
 # Define the receptor file
 RECEPTOR="9f5s_prep.maps.fld"
 

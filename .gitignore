@@ -1,2 +1,6 @@
 test.ipynb
 __pycache__
+Data/ad4_receptor_input
+Data/ligands
+Data/9F6A_prepared_AD4.pdb
+Data/ligand_batch.txt
