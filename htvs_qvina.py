@@ -12,14 +12,14 @@ import tempfile
 import re
 import shutil
 from io import StringIO
+import multiprocessing
 
 # START: Script params.
 
-batch_size = 5  # Number of ligands per batch. Processing is done in batches as the ligand strings are held in memory during processing.
-n_cores_meeko = 12  # Core count for Meeko multiprocessing using joblib.
-n_cores_vina = 2 # Core (process) count for Vina multiprocessing.
-n_vina_threads = 8 # Number of threads to use per Vina instance (Vina's 'cpu' setting").
-qvina_gpu_threads = 8000
+batch_size = 500  # Number of ligands per batch. Processing is done in batches as the ligand strings are held in memory during processing.
+n_cores_meeko = 24  # Core count for Meeko multiprocessing using joblib.
+qvina_gpu_threads = 5000
+qvina_search_depth = 8 # Equivalent to the 'exhaustiveness' parameter in Vina. By default determined heuristically during execution.
 vina_scoring_function = "vina" # Scoring function to use with Vina.
 
 # Path to QuickVina2-GPU binary and the OpenCL binaries.
@@ -27,7 +27,7 @@ qvina_executable = "/home/fbsehi/tools/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina
 opencl_binary_path = "/home/fbsehi/tools/Vina-GPU-2.1/QuickVina2-GPU-2.1"
 
 # Data input directory holding ligand library and receptor.
-input_directory = "./"
+input_directory = "Data/"
 
 # Output directory for the Ringtail database.
 output_directory = "htvs_qvina_output/"
@@ -135,14 +135,19 @@ def write_ligands_to_directory(ligands, batch_dir):
         ligand_files[file_path] = idx
     return ligand_files
 
-# Modified docking function to handle batches
-def dock_batch_with_qvina(receptor_file, docking_box, ligands, batch_id):
+# Modified docking function to handle GPU selection
+def dock_batch_with_qvina(receptor_file, docking_box, ligands, batch_id, gpu_id):
     batch_dir = None
     try:
-        batch_dir = create_batch_directory(batch_id)
+        batch_dir = create_batch_directory(f"{batch_id}_gpu{gpu_id}")
+        output_dir = os.path.join(batch_dir, 'output')
+        os.makedirs(output_dir)
+        
+        print(f"Debug: Created directories - batch: {batch_dir}, output: {output_dir}")
         ligand_files = write_ligands_to_directory(ligands, batch_dir)
         
-        vina_cmd = f'{qvina_executable} --receptor {receptor_file} '\
+        # Add CUDA_VISIBLE_DEVICES prefix to the command
+        vina_cmd = f'CUDA_VISIBLE_DEVICES={gpu_id} {qvina_executable} --receptor {receptor_file} '\
                    f'--ligand_directory {batch_dir} '\
                    f'--thread {qvina_gpu_threads} '\
                    f'--center_x {docking_box["center"][0]} '\
@@ -152,57 +157,46 @@ def dock_batch_with_qvina(receptor_file, docking_box, ligands, batch_id):
                    f'--size_y {docking_box["box_size"][1]} '\
                    f'--size_z {docking_box["box_size"][2]} '\
                    f'--opencl_binary_path {opencl_binary_path} '\
-                   f'--out /dev/stdout'
+                   f'--output_directory {output_dir}'
 
-        # Use Popen for streaming output processing
+        print(f"Debug: Executing command:\n{vina_cmd}")
+
         process = subprocess.Popen(
             vina_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1,
-            shell=True,
-            universal_newlines=True
+            shell=True
         )
 
+        # Monitor process execution
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            print(f"Debug: QuickVina stderr:\n{stderr}")
+            raise subprocess.CalledProcessError(process.returncode, vina_cmd)
+
+        # Read output files and collect results
         vina_output = {}
-        output_buffer = StringIO()
-        current_ligand = None
-        
-        # Process output in a streaming fashion
-        for line in process.stdout:
-            if line.startswith('REMARK Name ='):
-                if current_ligand and output_buffer.tell() > 0:
-                    # Get the buffer contents and reset
-                    output_buffer.seek(0)
-                    vina_output[current_ligand] = output_buffer.getvalue()
-                    output_buffer = StringIO()  # Create new buffer
-                current_ligand = line.split('=')[1].strip()
-                output_buffer.write(line)
-            elif current_ligand and (line.startswith(('MODEL', 'ATOM', 'HETATM', 'ENDMDL'))):
-                output_buffer.write(line)
-
-        # Handle the last ligand
-        if current_ligand and output_buffer.tell() > 0:
-            output_buffer.seek(0)
-            vina_output[current_ligand] = output_buffer.getvalue()
-
-        # Clean up
-        output_buffer.close()
-        process.stdout.close()
-        process.stderr.close()
+        for output_file in os.listdir(output_dir):
+            if output_file.endswith('_out.pdbqt'):
+                ligand_name = output_file.replace('_out.pdbqt', '')
+                with open(os.path.join(output_dir, output_file)) as f:
+                    vina_output[ligand_name] = f.read()
+                #print(f"Debug: Read output for {ligand_name}")
         
         return vina_output
-        
-    except subprocess.CalledProcessError as e:
-        print(f"Vina docking failed for batch {batch_id}: {e.output}")
-        return {}
+
     except Exception as e:
         print(f"Error in docking batch {batch_id}: {str(e)}")
         return {}
     finally:
         if batch_dir and os.path.exists(batch_dir):
             shutil.rmtree(batch_dir)
+
+# Add this function to handle parallel GPU docking
+def run_parallel_gpu_docking(args):
+    receptor_file, docking_box, batch, batch_id, gpu_id = args
+    return dock_batch_with_qvina(receptor_file, docking_box, batch, batch_id, gpu_id)
 
 # Function to handle batching of ligands.
 def process_batches(ligand_input_file, batch_size):
@@ -244,14 +238,24 @@ def process_batches(ligand_input_file, batch_size):
                 prep_time = time.time() - prep_start
                 print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in batch {current_batch} ({prep_time:.2f}s)")
 
-                # Modified docking step
+                # Split batch and run on GPUs in parallel
+                half_size = len(flattened_batch) // 2
+                batch1 = flattened_batch[:half_size]
+                batch2 = flattened_batch[half_size:]
+
                 dock_start = time.time()
-                vina_results = dock_batch_with_qvina(
-                    receptor_file, 
-                    docking_box, 
-                    flattened_batch, 
-                    current_batch
-                )
+                # Create arguments for parallel processing
+                gpu_args = [
+                    (receptor_file, docking_box, batch1, f"{current_batch}_1", 0),
+                    (receptor_file, docking_box, batch2, f"{current_batch}_2", 1)
+                ]
+
+                # Run docking in parallel on both GPUs
+                with multiprocessing.Pool(2) as pool:
+                    results = pool.map(run_parallel_gpu_docking, gpu_args)
+
+                # Merge results from both GPUs
+                vina_results = {**results[0], **results[1]}
                 dock_time = time.time() - dock_start
                 print(f"Successfully docked {len(vina_results)} variants in batch {current_batch} ({dock_time:.2f}s)")
 
@@ -264,6 +268,8 @@ def process_batches(ligand_input_file, batch_size):
                 converted_batch.clear()
 
     # Process the leftover ligands in the last batch.
+    # This could be changed so that instead of doing this, check if the remaining ligands are able to
+    # fill a batch and if they are not, then add them to the previous batch and process all at once.
     if batch:
         batch_start_time = time.time()
         current_batch += 1
@@ -278,13 +284,20 @@ def process_batches(ligand_input_file, batch_size):
         prep_time = time.time() - prep_start
         print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in final batch ({prep_time:.2f}s)")
 
+        half_size = len(flattened_batch) // 2
+        batch1 = flattened_batch[:half_size]
+        batch2 = flattened_batch[half_size:]
+
         dock_start = time.time()
-        vina_results = dock_batch_with_qvina(
-            receptor_file, 
-            docking_box, 
-            flattened_batch, 
-            current_batch
-        )
+        gpu_args = [
+            (receptor_file, docking_box, batch1, f"{current_batch}_1", 0),
+            (receptor_file, docking_box, batch2, f"{current_batch}_2", 1)
+        ]
+
+        with multiprocessing.Pool(2) as pool:
+            results = pool.map(run_parallel_gpu_docking, gpu_args)
+
+        vina_results = {**results[0], **results[1]}
         dock_time = time.time() - dock_start
         print(f"Successfully docked {len(vina_results)} variants in final batch ({dock_time:.2f}s)")
 
@@ -296,7 +309,7 @@ def process_batches(ligand_input_file, batch_size):
 
     # Save the receptor to the Ringtail database.
     if save_receptor_to_db:
-        db.save_receptor(receptor_file = receptor_file) # This will cause an issue if the receptor is already saved to the db from a previous script execution.
+        db.save_receptor(receptor_file = receptor_file) # This should be the original .pdb file instead of the .pdbqt file.
     print("\nReceptor successfully saved to the database.")
 
     db.finalize_write()
