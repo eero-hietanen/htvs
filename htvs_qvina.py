@@ -2,6 +2,7 @@
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -124,6 +125,10 @@ def create_batch_directory(batch_id: str) -> str:
     batch_dir = tempfile.mkdtemp(prefix=f'batch_{batch_id}_')
     return batch_dir
 
+# Initialize worker with signal handler.
+def init_worker():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
 # Write ligands to batch directory.
 def write_ligands_to_directory(ligands: List[Tuple[str, str]], batch_dir: str) -> Dict[str, str]:
     ligand_files = {}
@@ -157,8 +162,8 @@ def dock_batch_with_qvina(RECEPTOR_FILE: str, DOCKING_BOX: Dict[str, Any], ligan
                    f'--size_x {DOCKING_BOX["box_size"][0]} '\
                    f'--size_y {DOCKING_BOX["box_size"][1]} '\
                    f'--size_z {DOCKING_BOX["box_size"][2]} '\
-                   f'--OPENCL_BINARY_PATH {OPENCL_BINARY_PATH} '\
-                   f'--OUTPUT_DIR {output_dir}'
+                   f'--opencl_binary_path {OPENCL_BINARY_PATH} '\
+                   f'--output_directory {output_dir}'
 
         print(f"Debug: Executing command:\n{vina_cmd}")
 
@@ -184,7 +189,7 @@ def dock_batch_with_qvina(RECEPTOR_FILE: str, DOCKING_BOX: Dict[str, Any], ligan
                 with open(os.path.join(output_dir, output_file)) as f:
                     vina_output[ligand_name] = f.read()
                 #print(f"Debug: Read output for {ligand_name}")
-        
+
         return vina_output
 
     except Exception as e:
@@ -234,7 +239,15 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int) -> None:
 
                 # Molecule preparation step using Meeko and joblib parallelization.
                 prep_start = time.time()
-                converted_batch = Parallel(n_jobs=N_CORES_MEEKO)(delayed(molecule_prep)(smiles, mol_name) for smiles, mol_name in batch)
+                try:
+                    with Parallel(n_jobs=N_CORES_MEEKO) as parallel:
+                        converted_batch = parallel(
+                            delayed(molecule_prep)(smiles, mol_name) 
+                            for smiles, mol_name in batch
+                        )
+                finally:
+                    # Force cleanup of any remaining processes
+                    Parallel(n_jobs=1)
                 flattened_batch = [variant for molecule_variants in converted_batch for variant in molecule_variants]
                 prep_time = time.time() - prep_start
                 print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in batch {current_batch} ({prep_time:.2f}s)")
@@ -252,8 +265,12 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int) -> None:
                 ]
 
                 # Run docking in parallel on both GPUs.
-                with multiprocessing.Pool(2) as pool:
+                pool = multiprocessing.Pool(2, init_worker)
+                try:
                     results = pool.map(run_parallel_gpu_docking, gpu_args)
+                finally:
+                    pool.close()
+                    pool.join()
 
                 # Merge results from both GPUs.
                 vina_results = {**results[0], **results[1]}
