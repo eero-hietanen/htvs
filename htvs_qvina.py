@@ -23,7 +23,7 @@ import ringtail as rtc
 
 BATCH_SIZE = 5000  # Number of ligands per batch. The batch is split between GPUs.
 N_CORES_MEEKO = 20  # Core count for Meeko multiprocessing using joblib.
-QVINA_GPU_THREADS = 5000 # Ideally less than 10000 as per the documentation. Suggested for Vina is 5000.
+QVINA_GPU_THREADS = 5000 # Ideally less than 10000 as per the documentation. Suggested for QuickVina2 is 5000.
 
 # Path to QuickVina2-GPU binary and the OpenCL binaries.
 QVINA_EXECUTABLE = "/home/fbsehi/tools/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1"
@@ -41,11 +41,11 @@ if not os.path.exists(OUTPUT_DIR):
 SMI_FILE = os.path.join(INPUT_DIR, "2024.07_Enamine_REAL_DB_9.6M.cxsmiles")
 
 # Receptor file in .pdbqt format.
-# The receptor should be previously prepared with Meeko 'mk_prepare_receptor.py' (doesn't seem to be a Python API available, but could be done by calling it as a subprocess).
+# The receptor should be previously prepared with Meeko 'mk_prepare_receptor.py' or otherwise.
 RECEPTOR_FILE = os.path.join(INPUT_DIR, "9F6A_prepared.pdbqt")
 SAVE_RECEPTOR = True
 
-# Docking box params for Vina.
+# Docking box parameters for Vina.
 DOCKING_BOX = {"center": [136.733, 172.819, 99.189], "box_size": [11.69, 7.09, 7.60]}
 
 # Initialize the Ringtail database.
@@ -88,12 +88,7 @@ def molecule_prep(smiles: str, mol_name: str) -> List[Tuple[str, str]]:
         try:
             # Scrubber handles protonation states, 3D coordinates, and tautomers. Will raise valance and kekulization exceptions quite often.
             for mol_index, mol_state in enumerate(scrub(mol)):
-                variant_mol_name = f"{mol_name}-{mol_index}" # TODO: See how to get the ligand variant docking to work without changing the name for each variant. Then see how Ringtail handles the duplicates.
-                # variant_mol_name = f"{mol_name}" # If this is used then the docking result dictionary building breaks due to dictionary key collision.
-
-                # fragments = Chem.GetMolFrags(mol_state, asMols=True)
-                # if len(fragments) > 1:
-                #     mol_state = max(fragments, key=lambda m: m.GetNumAtoms())
+                variant_mol_name = f"{mol_name}-{mol_index}"
 
                 chooser = rdMolStandardize.LargestFragmentChooser() # In case of fragmented ligands, choose the largest fragment.
                 mol_state = chooser.choose(mol_state)
@@ -126,6 +121,7 @@ def create_batch_directory(batch_id: str) -> str:
     return batch_dir
 
 # Initialize worker with signal handler.
+# This is here in hopes of avoiding zombie processes during execution, but it might be useless.
 def init_worker():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -226,9 +222,9 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int) -> None:
 
         for line in f:
             parts = line.strip().split("\t")
-            if len(parts) >= 2:  # Ensure the line has both SMILES and name.
+            if len(parts) >= 2:  # Ensure the line has both SMILES and ligand name.
                 smiles, mol_name = line, parts[1]
-                batch.append((smiles, mol_name))  # Append a tuple of SMILES and name.
+                batch.append((smiles, mol_name))  # Append a tuple of SMILES and ligand name.
 
             # When the batch reaches the specified size, process it.
             if len(batch) == BATCH_SIZE:
@@ -347,5 +343,5 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-#NOTE: The Ringtail command line option to write sdf files is rt_process_vs read --input_db output.db --bookmark_name bookmark1 --export_sdf_path sdf_files/
-#TODO: Implement a receptor preparation method.
+#NOTE: The Ringtail command line option to write sdf files is rt_process_vs read --input_db output.db --bookmark_name my_bookmark --export_sdf_path sdf_files/
+#TODO: Implement a receptor preparation.
