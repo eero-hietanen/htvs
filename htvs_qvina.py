@@ -26,8 +26,8 @@ N_CORES_MEEKO = 20  # Core count for Meeko multiprocessing using joblib.
 QVINA_GPU_THREADS = 5000 # Ideally less than 10000 as per the documentation. Suggested for QuickVina2 is 5000.
 
 # Path to QuickVina2-GPU binary and the OpenCL binaries.
-QVINA_EXECUTABLE = "/home/fbsehi/tools/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1"
-OPENCL_BINARY_PATH = "/home/fbsehi/tools/Vina-GPU-2.1/QuickVina2-GPU-2.1"
+QVINA_EXECUTABLE = "/path/to/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1"
+OPENCL_BINARY_PATH = "/path/to/Vina-GPU-2.1/QuickVina2-GPU-2.1"
 
 # Data input directory holding ligand library and receptor.
 INPUT_DIR = "./"
