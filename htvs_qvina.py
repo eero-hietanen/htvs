@@ -42,7 +42,8 @@ SMI_FILE = os.path.join(INPUT_DIR, "2024.07_Enamine_REAL_DB_9.6M.cxsmiles")
 
 # Receptor file in .pdbqt format.
 # The receptor should be previously prepared with Meeko 'mk_prepare_receptor.py' or otherwise.
-RECEPTOR_FILE = os.path.join(INPUT_DIR, "9F6A_prepared.pdbqt")
+# RECEPTOR_FILE = os.path.join(INPUT_DIR, "9F6A_prepared.pdbqt")
+RECEPTOR_PDB = "9F6A" # Fetch receptor from RCSB PDB with curl and prepare with Meeko using receptor_prep().
 SAVE_RECEPTOR = True
 
 # Docking box parameters for Vina.
@@ -54,6 +55,17 @@ DB = rtc.RingtailCore(db_file = OUTPUT_DIR + "output.db", docking_mode = "vina")
 # END: Script params.
 
 ##############################################
+
+# Fetch receptor structure from PDB with curl. The base URL for the download is https://files.rcsb.org/download/
+# Call Meeko to prepare the receptor and output a .pdbqt file.
+def receptor_prep(RECEPTOR_PDB: str) -> str:
+    receptor_url = f"https://files.rcsb.org/download/{RECEPTOR_PDB}.pdb"
+    receptor_file = os.path.join(INPUT_DIR, f"{RECEPTOR_PDB}.pdb")
+
+    subprocess.run(["curl", "-o", receptor_file, receptor_url])
+    subprocess.run(["mk_prepare_receptor.py", "-i", receptor_file, "-p", "-o", f"{RECEPTOR_PDB}_prepared"])
+    RECEPTOR_FILE = os.path.join(INPUT_DIR, f"{RECEPTOR_PDB}_prepared.pdbqt")
+    return RECEPTOR_FILE
 
 # Function to convert a ligand to .pdbqt format using Meeko on the fly.
 # Uses rdkit to add explicit hydrogens and 3D coordinates for the ligand.
@@ -333,6 +345,12 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int) -> None:
     print(f"Average time per ligand: {total_time/total_lines:.2f}s")
 
 def main() -> None:
+
+    # Declare the receptor file as a global variable so that it's accessible.
+    global RECEPTOR_FILE
+    # Fetch and prepare the receptor structure based on the PDB ID.
+    RECEPTOR_FILE = receptor_prep(RECEPTOR_PDB)
+
     # Process all batches and add docking results to Ringtail database.
     process_batches(SMI_FILE, BATCH_SIZE)
 
