@@ -4,6 +4,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from typing import List, Tuple, Dict, Any
@@ -22,8 +23,19 @@ import ringtail as rtc
 # START: Script params.
 
 BATCH_SIZE = 5000  # Number of ligands per batch. The batch is split between GPUs.
+START_BATCH = 1099 # 0 indexed
+RESUME_FROM_LINE = START_BATCH * BATCH_SIZE
 N_CORES_MEEKO = 20  # Core count for Meeko multiprocessing using joblib.
+N_PROCESSES_QVINA = 4 # Number of VinaGPU processes to run in parallel with each one handling a batch. NOTE: Single NVIDIA A40 GPU seems to have enough memory to handle 3 batches at once (Enamine 9.6M library, 5000 batch size).
 QVINA_GPU_THREADS = 5000 # Ideally less than 10000 as per the documentation. Suggested for QuickVina2 is 5000.
+
+# Fetch the number of NVIDIA GPUs on the system.
+cmd = f"nvidia-smi -L | wc -l"
+proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+stdout, stderr = proc.communicate(timeout = 10)
+assert proc.returncode == 0, f"Error: {stderr}"
+NUM_GPUS = int(stdout.decode("utf-8").strip())
+NUM_GPUS_USED = NUM_GPUS # By default uses all GPUs on the system.
 
 # Path to QuickVina2-GPU binary and the OpenCL binaries.
 QVINA_EXECUTABLE = "/path/to/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1"
@@ -42,8 +54,8 @@ SMI_FILE = os.path.join(INPUT_DIR, "2024.07_Enamine_REAL_DB_9.6M.cxsmiles")
 
 # Receptor file in .pdbqt format.
 # The receptor should be previously prepared with Meeko 'mk_prepare_receptor.py' or otherwise.
-# RECEPTOR_FILE = os.path.join(INPUT_DIR, "9F6A_prepared.pdbqt")
-RECEPTOR_PDB = "9F6A" # Fetch receptor from RCSB PDB with curl and prepare with Meeko using receptor_prep().
+RECEPTOR_FILE = os.path.join(INPUT_DIR, "9F6A_prepared.pdbqt")
+#RECEPTOR_PDB = "9F6A" # Fetch receptor from RCSB PDB with curl and prepare with Meeko using receptor_prep().
 SAVE_RECEPTOR = True
 
 # Docking box parameters for Vina.
@@ -55,6 +67,52 @@ DB = rtc.RingtailCore(db_file = OUTPUT_DIR + "output.db", docking_mode = "vina")
 # END: Script params.
 
 ##############################################
+
+# Split the batch into GPU batches based on the number of GPUs used. Two batches are run per GPU.
+def generate_gpu_args(batch_input, RECEPTOR_FILE, DOCKING_BOX, current_batch, NUM_GPUS_USED):
+    # Split the batch into sub-batches for each GPU.
+    batches = split_list_into_batches(batch_input, NUM_GPUS_USED*2)
+
+    # Generate the arguments for each GPU.
+    gpu_args = []
+    for i, batch in enumerate(batches):
+        # GPU ID is 0 indexed and it increases every 2 sub-batches.
+        gpu_id = i // 2
+        gpu_args.append((RECEPTOR_FILE, DOCKING_BOX, batch, f"{current_batch}_{i+1}", gpu_id))
+
+    return gpu_args
+
+# Splits a list into sub-batches that will be distributed to different Vina instances.
+def split_list_into_batches(input_list, num_batches):
+    list_length = len(input_list)
+    
+    # Ensure num_batches doesn't exceed list length.
+    num_batches = min(num_batches, list_length)
+    
+    # Calculate base size and remainder.
+    base_size = list_length // num_batches
+    remainder = list_length % num_batches
+    
+    batches = []
+    start = 0
+    
+    for i in range(num_batches):
+        # Add one extra element to early batches if there's remainder.
+        batch_size = base_size + (1 if i < remainder else 0)
+        end = start + batch_size
+        batches.append(input_list[start:end])
+        start = end
+    
+    return batches
+
+# Cleanup function called with KeyboardInterrupt exceptions and at the end of processing.
+def cleanup() -> None:
+    print("\nPerforming cleanup...")
+    try:
+        DB.finalize_write()
+        print("Database writing finalized.")
+    except Exception as e:
+        print(f"Error during cleanup: {str(e)}")
 
 # Fetch receptor structure from PDB with curl. The base URL for the download is https://files.rcsb.org/download/
 # Call Meeko to prepare the receptor and output a .pdbqt file.
@@ -213,153 +271,186 @@ def run_parallel_gpu_docking(args: Tuple[str, Dict[str, Any], List[Tuple[str, st
     return dock_batch_with_qvina(RECEPTOR_FILE, DOCKING_BOX, batch, batch_id, gpu_id)
 
 # Function to handle reading the input SMILES file and splitting it into batches.
-def process_batches(ligand_input_file: str, BATCH_SIZE: int) -> None:
+def process_batches(ligand_input_file: str, BATCH_SIZE: int, start_from_line: int = 0) -> None:
     start_time = time.time()
-    batch = []
-    file_extension = os.path.splitext(ligand_input_file)[1].lower()
+    lines_skipped = 0
+    try:
+        batch = []
+        file_extension = os.path.splitext(ligand_input_file)[1].lower()
 
-    # Count total lines to calculate total batches.
-    total_lines = sum(1 for _ in open(ligand_input_file))
-    if file_extension == '.cxsmiles':
-        total_lines -= 1  # Adjust for header in .cxsmiles files.
-    total_batches = (total_lines + BATCH_SIZE - 1) // BATCH_SIZE
-    current_batch = 0
-    total_processed = 0
-
-    print(f"\nProcessing {total_lines} ligands in {total_batches} batches...")
-
-    with open(ligand_input_file, "r") as f:
+        # Count total lines to calculate total batches.
+        total_lines = sum(1 for _ in open(ligand_input_file))
         if file_extension == '.cxsmiles':
-            next(f)
+            total_lines -= 1  # Adjust for header in .cxsmiles files.
 
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) >= 2:  # Ensure the line has both SMILES and ligand name.
-                smiles, mol_name = line, parts[1]
-                batch.append((smiles, mol_name))  # Append a tuple of SMILES and ligand name.
+        remaining_lines = total_lines - start_from_line
+        total_batches = (remaining_lines + BATCH_SIZE - 1) // BATCH_SIZE
+        current_batch = start_from_line // BATCH_SIZE
+        total_processed = 0
 
-            # When the batch reaches the specified size, process it.
-            if len(batch) == BATCH_SIZE:
-                batch_start_time = time.time()
-                current_batch += 1
-                total_processed += len(batch)
-                print(f"\nProcessing batch {current_batch}/{total_batches} ({total_processed}/{total_lines} ligands processed)")
+        print(f"\nStarting from batch {current_batch + 1} (line {start_from_line})")
+        print(f"Processing {remaining_lines} remaining ligands in {total_batches} batches...")
 
-                # Molecule preparation step using Meeko and joblib parallelization.
-                prep_start = time.time()
-                try:
-                    with Parallel(n_jobs=N_CORES_MEEKO) as parallel:
-                        converted_batch = parallel(
-                            delayed(molecule_prep)(smiles, mol_name) 
-                            for smiles, mol_name in batch
-                        )
-                finally:
-                    # Force cleanup of any remaining processes
-                    Parallel(n_jobs=1)
-                flattened_batch = [variant for molecule_variants in converted_batch for variant in molecule_variants]
-                prep_time = time.time() - prep_start
-                print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in batch {current_batch} ({prep_time:.2f}s)")
+        with open(ligand_input_file, "r") as f:
+            if file_extension == '.cxsmiles':
+                next(f)
 
-                # Split batch and run on GPUs in parallel.
-                half_size = len(flattened_batch) // 2
-                batch1 = flattened_batch[:half_size]
-                batch2 = flattened_batch[half_size:]
+            # Skip to starting line
+            for _ in range(start_from_line):
+                next(f)
+                lines_skipped += 1
 
-                dock_start = time.time()
-                # Create arguments for parallel processing.
-                gpu_args = [
-                    (RECEPTOR_FILE, DOCKING_BOX, batch1, f"{current_batch}_1", 0),
-                    (RECEPTOR_FILE, DOCKING_BOX, batch2, f"{current_batch}_2", 1)
-                ]
+            print(f"Skipped {lines_skipped} lines")
 
-                # Run docking in parallel on both GPUs.
-                pool = multiprocessing.Pool(2, init_worker)
-                try:
-                    results = pool.map(run_parallel_gpu_docking, gpu_args)
-                finally:
-                    pool.close()
-                    pool.join()
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 2:  # Ensure the line has both SMILES and ligand name.
+                    smiles, mol_name = line, parts[1]
+                    batch.append((smiles, mol_name))  # Append a tuple of SMILES and ligand name.
 
-                # Merge results from both GPUs.
-                vina_results = {**results[0], **results[1]}
+                # When the batch reaches the specified size, process it.
+                if len(batch) == BATCH_SIZE:
+                    batch_start_time = time.time()
+                    current_batch += 1
+                    total_processed += len(batch)
+                    print(f"\nProcessing batch {current_batch}/{total_batches} ({total_processed}/{total_lines} ligands processed)")
+
+                    # Molecule preparation step using Meeko and joblib parallelization.
+                    prep_start = time.time()
+                    try:
+                        with Parallel(n_jobs=N_CORES_MEEKO) as parallel:
+                            converted_batch = parallel(
+                                delayed(molecule_prep)(smiles, mol_name)
+                                for smiles, mol_name in batch
+                            )
+                    finally:
+                        # Force cleanup of any remaining processes
+                        Parallel(n_jobs=1)
+                    flattened_batch = [variant for molecule_variants in converted_batch for variant in molecule_variants]
+                    prep_time = time.time() - prep_start
+                    print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in batch {current_batch} ({prep_time:.2f}s)")
+                    dock_start = time.time()
+
+                    # Create arguments for parallel processing.
+                    gpu_args = generate_gpu_args(flattened_batch, RECEPTOR_FILE, DOCKING_BOX, current_batch, NUM_GPUS_USED)
+
+                    # Run docking in parallel on both GPUs.
+                    pool = multiprocessing.Pool(NUM_GPUS_USED*2, init_worker)
+                    try:
+                        results = pool.map(run_parallel_gpu_docking, gpu_args)
+                    finally:
+                        pool.close()
+                        pool.join()
+
+                    # Merge results from GPUs.
+                    vina_results = {}
+                    for result in results:
+                        vina_results.update(result)
+
+                    if not vina_results:
+                        print(f"Warning: No successful docking results in batch {current_batch}, skipping...")
+                        batch.clear()
+                        converted_batch.clear()
+                        continue
+
+                    dock_time = time.time() - dock_start
+                    print(f"Successfully docked {len(vina_results)} variants in batch {current_batch} ({dock_time:.2f}s)")
+
+                    batch_time = time.time() - batch_start_time
+                    avg_time_per_ligand = batch_time / len(batch)
+                    print(f"Batch {current_batch} completed in {batch_time:.2f}s (avg {avg_time_per_ligand:.2f}s per ligand)")
+
+                    DB.add_results_from_vina_string(vina_results, finalize = False)
+                    batch.clear()
+                    converted_batch.clear()
+
+        # Process the leftover ligands in the last batch.
+        # This could be changed so that instead of doing this, check if the remaining ligands are able to
+        # fill a batch and if they are not, then add them to the previous batch and process all at once.
+        if batch:
+            batch_start_time = time.time()
+            current_batch += 1
+            total_processed += len(batch)
+            print(f"\nProcessing final batch {current_batch}/{total_batches} ({total_processed}/{total_lines} ligands processed)")
+
+            prep_start = time.time()
+            converted_batch = Parallel(n_jobs=N_CORES_MEEKO)(
+                delayed(molecule_prep)(smiles, mol_name) for smiles, mol_name in batch
+            )
+            flattened_batch = [variant for molecule_variants in converted_batch for variant in molecule_variants]
+            prep_time = time.time() - prep_start
+            print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in final batch ({prep_time:.2f}s)")
+            dock_start = time.time()
+
+            # Create arguments for parallel processing.
+            gpu_args = generate_gpu_args(flattened_batch, RECEPTOR_FILE, DOCKING_BOX, current_batch, NUM_GPUS_USED)
+
+            with multiprocessing.Pool(NUM_GPUS_USED*2) as pool:
+                results = pool.map(run_parallel_gpu_docking, gpu_args)
+
+            # Merge results from GPUs.
+            vina_results = {}
+            for result in results:
+                vina_results.update(result)
+
+            if not vina_results:
+                print(f"Warning: No successful docking results in final batch, skipping...")
+                batch.clear()
+            else:
                 dock_time = time.time() - dock_start
-                print(f"Successfully docked {len(vina_results)} variants in batch {current_batch} ({dock_time:.2f}s)")
+                print(f"Successfully docked {len(vina_results)} variants in final batch ({dock_time:.2f}s)")
 
                 batch_time = time.time() - batch_start_time
                 avg_time_per_ligand = batch_time / len(batch)
-                print(f"Batch {current_batch} completed in {batch_time:.2f}s (avg {avg_time_per_ligand:.2f}s per ligand)")
-
+                print(f"Final batch completed in {batch_time:.2f}s (avg {avg_time_per_ligand:.2f}s per ligand)")
                 DB.add_results_from_vina_string(vina_results, finalize = False)
                 batch.clear()
-                converted_batch.clear()
 
-    # Process the leftover ligands in the last batch.
-    # This could be changed so that instead of doing this, check if the remaining ligands are able to
-    # fill a batch and if they are not, then add them to the previous batch and process all at once.
-    if batch:
-        batch_start_time = time.time()
-        current_batch += 1
-        total_processed += len(batch)
-        print(f"\nProcessing final batch {current_batch}/{total_batches} ({total_processed}/{total_lines} ligands processed)")
+        # Save the receptor to the Ringtail database.
+        if SAVE_RECEPTOR:
+            DB.save_receptor(receptor_file = RECEPTOR_FILE)
+        print("\nReceptor successfully saved to the database.")
 
-        prep_start = time.time()
-        converted_batch = Parallel(n_jobs=N_CORES_MEEKO)(
-            delayed(molecule_prep)(smiles, mol_name) for smiles, mol_name in batch
-        )
-        flattened_batch = [variant for molecule_variants in converted_batch for variant in molecule_variants]
-        prep_time = time.time() - prep_start
-        print(f"Generated {len(flattened_batch)} variants for {len(batch)} ligands in final batch ({prep_time:.2f}s)")
+        DB.finalize_write()
 
-        half_size = len(flattened_batch) // 2
-        batch1 = flattened_batch[:half_size]
-        batch2 = flattened_batch[half_size:]
-
-        dock_start = time.time()
-        gpu_args = [
-            (RECEPTOR_FILE, DOCKING_BOX, batch1, f"{current_batch}_1", 0),
-            (RECEPTOR_FILE, DOCKING_BOX, batch2, f"{current_batch}_2", 1)
-        ]
-
-        with multiprocessing.Pool(2) as pool:
-            results = pool.map(run_parallel_gpu_docking, gpu_args)
-
-        vina_results = {**results[0], **results[1]}
-        dock_time = time.time() - dock_start
-        print(f"Successfully docked {len(vina_results)} variants in final batch ({dock_time:.2f}s)")
-
-        batch_time = time.time() - batch_start_time
-        avg_time_per_ligand = batch_time / len(batch)
-        print(f"Final batch completed in {batch_time:.2f}s (avg {avg_time_per_ligand:.2f}s per ligand)")
-        DB.add_results_from_vina_string(vina_results, finalize = False) # Add the "add_interactions" param. here? Will be slow with Vina.
-        batch.clear()
-
-    # Save the receptor to the Ringtail database.
-    if SAVE_RECEPTOR:
-        DB.save_receptor(receptor_file = RECEPTOR_FILE)
-    print("\nReceptor successfully saved to the database.")
-
-    DB.finalize_write()
-
-    total_time = time.time() - start_time
-    print(f"\nTotal processing time: {total_time:.2f}s")
-    print(f"Average time per ligand: {total_time/total_lines:.2f}s")
+        total_time = time.time() - start_time
+        print(f"\nTotal processing time: {total_time:.2f}s")
+        print(f"Average time per ligand: {total_time/total_lines:.2f}s")
+    except KeyboardInterrupt:
+        print("\nBatch processing interrupted by user.")
+        cleanup()
+        raise
+    except Exception as e:
+        print(f"An error occurred during batch processing: {str(e)}")
+        cleanup()
+        raise
+    finally:
+        cleanup()
 
 def main() -> None:
+    try:
+        # Declare the receptor file as a global variable so that it's accessible.
+        global RECEPTOR_FILE
+        # Fetch and prepare the receptor structure based on the PDB ID.
+        # RECEPTOR_FILE = receptor_prep(RECEPTOR_PDB)
+        RECEPTOR_FILE = "9F6A_prepared.pdbqt"
 
-    # Declare the receptor file as a global variable so that it's accessible.
-    global RECEPTOR_FILE
-    # Fetch and prepare the receptor structure based on the PDB ID.
-    RECEPTOR_FILE = receptor_prep(RECEPTOR_PDB)
+        # Process all batches and add docking results to Ringtail database.
+        process_batches(SMI_FILE, BATCH_SIZE, start_from_line=RESUME_FROM_LINE)
 
-    # Process all batches and add docking results to Ringtail database.
-    process_batches(SMI_FILE, BATCH_SIZE)
-
-    # Make a filter for the top 1% of docking results.
-    DB.filter(score_percentile=1, bookmark_name="top_1p_results", order_results="e")
-    print("\nDocking results successfully added to the Ringtail database.")
+        # Make a filter for the top 1% of docking results.
+        DB.filter(score_percentile=1, bookmark_name="top_1p_results", order_results="e")
+        print("\nDocking results successfully added to the Ringtail database.")
+    except KeyboardInterrupt:
+        print("\nScript interrupted by user.")
+        cleanup()
+        sys.exit(1)
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        cleanup()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
 
 #NOTE: The Ringtail command line option to write sdf files is rt_process_vs read --input_db output.db --bookmark_name my_bookmark --export_sdf_path sdf_files/
-#TODO: Implement a receptor preparation.
