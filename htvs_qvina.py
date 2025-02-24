@@ -23,10 +23,10 @@ import ringtail as rtc
 # START: Script params.
 
 BATCH_SIZE = 5000  # Number of ligands per batch. The batch is split between GPUs.
-START_BATCH = 1099 # 0 indexed
+START_BATCH = 0 # 0 indexed
 RESUME_FROM_LINE = START_BATCH * BATCH_SIZE
 N_CORES_MEEKO = 20  # Core count for Meeko multiprocessing using joblib.
-N_PROCESSES_QVINA = 4 # Number of VinaGPU processes to run in parallel with each one handling a batch. NOTE: Single NVIDIA A40 GPU seems to have enough memory to handle 3 batches at once (Enamine 9.6M library, 5000 batch size).
+N_PROCESSES_QVINA = 3 # Number of VinaGPU processes to run in parallel per GPU, with each one handling a batch. NOTE: Single NVIDIA A40 GPU seems to have enough memory to handle 3 batches at once (Enamine 9.6M library, 5000 batch size).
 QVINA_GPU_THREADS = 5000 # Ideally less than 10000 as per the documentation. Suggested for QuickVina2 is 5000.
 
 # Fetch the number of NVIDIA GPUs on the system.
@@ -335,7 +335,7 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int, start_from_line: in
                     gpu_args = generate_gpu_args(flattened_batch, RECEPTOR_FILE, DOCKING_BOX, current_batch, NUM_GPUS_USED)
 
                     # Run docking in parallel on both GPUs.
-                    pool = multiprocessing.Pool(NUM_GPUS_USED*2, init_worker)
+                    pool = multiprocessing.Pool(NUM_GPUS_USED*N_PROCESSES_QVINA, init_worker)
                     try:
                         results = pool.map(run_parallel_gpu_docking, gpu_args)
                     finally:
@@ -385,7 +385,7 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int, start_from_line: in
             # Create arguments for parallel processing.
             gpu_args = generate_gpu_args(flattened_batch, RECEPTOR_FILE, DOCKING_BOX, current_batch, NUM_GPUS_USED)
 
-            with multiprocessing.Pool(NUM_GPUS_USED*2) as pool:
+            with multiprocessing.Pool(NUM_GPUS_USED*N_PROCESSES_QVINA) as pool:
                 results = pool.map(run_parallel_gpu_docking, gpu_args)
 
             # Merge results from GPUs.
