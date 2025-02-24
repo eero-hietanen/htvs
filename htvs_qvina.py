@@ -35,7 +35,7 @@ proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subproce
 stdout, stderr = proc.communicate(timeout = 10)
 assert proc.returncode == 0, f"Error: {stderr}"
 NUM_GPUS = int(stdout.decode("utf-8").strip())
-NUM_GPUS_USED = NUM_GPUS # By default uses all GPUs on the system.
+NUM_GPUS_USED = NUM_GPUS # By default uses all GPUs on the system by setting NUM_GPUS_USED = NUM_GPUS.
 
 # Path to QuickVina2-GPU binary and the OpenCL binaries.
 QVINA_EXECUTABLE = "/path/to/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1"
@@ -284,12 +284,13 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int, start_from_line: in
             total_lines -= 1  # Adjust for header in .cxsmiles files.
 
         remaining_lines = total_lines - start_from_line
-        total_batches = (remaining_lines + BATCH_SIZE - 1) // BATCH_SIZE
+        total_batches = (total_lines + BATCH_SIZE - 1) // BATCH_SIZE
+        remaining_batches = total_batches - (start_from_line // BATCH_SIZE)
         current_batch = start_from_line // BATCH_SIZE
         total_processed = 0
 
         print(f"\nStarting from batch {current_batch + 1} (line {start_from_line})")
-        print(f"Processing {remaining_lines} remaining ligands in {total_batches} batches...")
+        print(f"Processing {remaining_lines} remaining ligands in {remaining_batches} batches (out of {total_batches} total batches)...")
 
         with open(ligand_input_file, "r") as f:
             if file_extension == '.cxsmiles':
@@ -454,3 +455,4 @@ if __name__ == "__main__":
     main()
 
 #NOTE: The Ringtail command line option to write sdf files is rt_process_vs read --input_db output.db --bookmark_name my_bookmark --export_sdf_path sdf_files/
+#TODO: All subprocess use cases should probably be done with shell=False and split commands. Instances that require piping need directing of p1 output to the stdin of p2 to mimic shell piping.
