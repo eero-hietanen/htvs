@@ -3,7 +3,6 @@ import os
 import re
 import shutil
 import signal
-from sre_constants import IN
 import subprocess
 import sys
 import tempfile
@@ -27,15 +26,7 @@ BATCH_SIZE = 100  # Number of ligands per batch. The batch is split between GPUs
 START_BATCH = 0 # 0 indexed
 RESUME_FROM_LINE = START_BATCH * BATCH_SIZE
 N_CORES_MEEKO = 12  # Core count for Meeko multiprocessing using joblib.
-N_PROCESSES_ADGPU = 1 # Number of AutoDock-GPU processes to run in parallel per GPU, with each one handling a batch. NOTE: Single NVIDIA A40 GPU seems to have enough memory to handle 3 batches at once (Enamine 9.6M library, 5000 batch size).
-
-# Fetch the number of NVIDIA GPUs on the system.
-cmd = f"nvidia-smi -L | wc -l"
-proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-stdout, stderr = proc.communicate(timeout = 10)
-assert proc.returncode == 0, f"Error: {stderr}"
-NUM_GPUS = int(stdout.decode("utf-8").strip())
-NUM_GPUS_USED = NUM_GPUS # By default uses all GPUs on the system by setting NUM_GPUS_USED = NUM_GPUS.
+N_PROCESSES_ADGPU = 1 # Number of AutoDock-GPU processes to run in parallel per GPU, with each one handling a batch.
 
 # Executable locations
 ADGPU_EXECUTABLE = "/home/fbsehi/github/autodock/adgpu-v1.6_linux_x64_cuda12_128wi"  # Path to AutoDock-GPU executable.
@@ -58,7 +49,7 @@ SMI_FILE = os.path.join(INPUT_DIR, "Testing/ligands_100.cxsmiles")
 RECEPTOR_PDB = "9F6A" # Fetch receptor from RCSB PDB with curl and prepare with Meeko using receptor_prep().
 SAVE_RECEPTOR = True
 
-# Docking box parameters for Vina.
+# Docking box parameters for preparing the grid map file.
 DOCKING_BOX = {"center": [136.733, 172.819, 99.189], "box_size": [11.69, 7.09, 7.60]}
 
 # Initialize the Ringtail database.
@@ -67,6 +58,17 @@ DB = rtc.RingtailCore(db_file = OUTPUT_DIR + "output.db")
 # END: Script params.
 
 ##############################################
+
+# Get the number of NVIDIA GPUs on the system.
+def get_gpu_count() -> int:
+    cmd = f"nvidia-smi -L | wc -l"
+    try:
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = proc.communicate(timeout = 10)
+        gpu_count = int(stdout.decode("utf-8", errors="replace").strip())
+    except Exception as e:
+        raise RuntimeError(f"Failed to determine GPU count. Command '{cmd}' returned an error: {e}")
+    return gpu_count
 
 # Generate a batch file to AutoDock-GPU (flag -B).
 # The batch file consists of a path to 1) the grid map file, 2) path to the ligand to be docked, and 3) the output file name.
@@ -102,7 +104,7 @@ def generate_gpu_args(batch_input, RECEPTOR_FILE, DOCKING_BOX, current_batch, NU
 
     return gpu_args
 
-# Splits a list into sub-batches that will be distributed to different Vina instances.
+# Splits a list into sub-batches that will be distributed to different ADGPU instances.
 def split_list_into_batches(input_list, num_batches):
     list_length = len(input_list)
     
@@ -166,7 +168,7 @@ def molecule_prep(smiles: str, mol_name: str) -> List[Tuple[str, str]]:
     rdBase.DisableLog('rdApp.error')
     rdBase.DisableLog('rdApp.warning')
 
-    # Set up Scrubber parameters. Variants are genereated for each ligand. The variant names are appended with an index number and all of them are directed to Vina for docking.
+    # Set up Scrubber parameters. Variants are genereated for each ligand. The variant names are appended with an index number and all of them are directed to ADGPU for docking.
     scrub = Scrub(
         ph_low = 6.9,
         ph_high = 7.9,
@@ -269,29 +271,17 @@ def dock_batch_with_adgpu(RECEPTOR_FILE: str, DOCKING_BOX: Dict[str, Any], ligan
             shell=True
         )
 
-        # Monitor process execution and print QuickVina errors if any.
+        # Monitor process execution and print errors if any.
         stdout, stderr = process.communicate()
         if process.returncode != 0:
             print(f"Debug: ADGPU stderr:\n{stderr}")
             raise subprocess.CalledProcessError(process.returncode, adgpu_cmd)
-
-        # # Read output files and collect results.
-        # vina_output = {}
-        # for output_file in os.listdir(output_dir):
-        #     if output_file.endswith('_out.pdbqt'):
-        #         ligand_name = output_file.replace('_out.pdbqt', '')
-        #         with open(os.path.join(output_dir, output_file)) as f:
-        #             vina_output[ligand_name] = f.read()
-        #         #print(f"Debug: Read output for {ligand_name}")
 
         return output_dir, batch_dir # Also return the batch_dir so that it can be used in process_batches() to remove the directory after DB write.
 
     except Exception as e:
         print(f"Error in docking batch {batch_id}: {str(e)}")
         return {}
-    # finally: # This is removing the batch dir before results can be added to the database. Move this to a later point, i.e. to process_batches().
-    #     if batch_dir and os.path.exists(batch_dir):
-    #         shutil.rmtree(batch_dir)
 
 # Function to handle parallel GPU docking.
 def run_parallel_gpu_docking(args: Tuple[str, Dict[str, Any], List[Tuple[str, str]], str, int]) -> Dict[str, str]:
@@ -375,18 +365,6 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int, start_from_line: in
                         pool.close()
                         pool.join()
 
-                    # Merge results from GPUs.
-                    # vina_results = {}
-                    # for result in results:
-                        # vina_results.update(result)
-                    # DB.add_results_from_files(file_path = results, recursive = True, finalize = False)
-
-                    # if not vina_results:
-                    #     print(f"Warning: No successful docking results in batch {current_batch}, skipping...")
-                    #     batch.clear()
-                    #     converted_batch.clear()
-                    #     continue
-
                     if not results:
                         print(f"Warning: No successful docking results in batch {current_batch}, skipping...")
                         batch.clear()
@@ -400,14 +378,13 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int, start_from_line: in
                         if batch_dir and os.path.exists(batch_dir):
                             shutil.rmtree(batch_dir)
 
-                    # dock_time = time.time() - dock_start
-                    # print(f"Successfully docked {len(vina_results)} variants in batch {current_batch} ({dock_time:.2f}s)")
+                    dock_time = time.time() - dock_start
+                    print(f"Batch {current_batch} docked in ({dock_time:.2f}s)")
 
                     batch_time = time.time() - batch_start_time
                     avg_time_per_ligand = batch_time / len(batch)
                     print(f"Batch {current_batch} completed in {batch_time:.2f}s (avg {avg_time_per_ligand:.2f}s per ligand)")
 
-                    # DB.add_results_from_vina_string(vina_results, finalize = False)
                     batch.clear()
                     converted_batch.clear()
 
@@ -439,19 +416,13 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int, start_from_line: in
             results = [path[0] for path in docking_results]  # Extract output_dir paths
             batch_dirs = [path[1] for path in docking_results]  # Extract batch_dir paths
 
-            # Merge results from GPUs.
-            # vina_results = {}
-            # for result in results:
-            #     # vina_results.update(result)
-            #     DB.add_results_from_files(file_path = result, finalize = False)
-
             if not results:
                 print(f"Warning: No successful docking results in final batch, skipping...")
                 batch.clear()
                 converted_batch.clear()
             else:
-                # dock_time = time.time() - dock_start
-                # print(f"Successfully docked {len(results)} variants in final batch ({dock_time:.2f}s)")
+                dock_time = time.time() - dock_start
+                print(f"Batch {current_batch} docked in ({dock_time:.2f}s)")
 
                 batch_time = time.time() - batch_start_time
                 avg_time_per_ligand = batch_time / len(batch)
@@ -468,8 +439,6 @@ def process_batches(ligand_input_file: str, BATCH_SIZE: int, start_from_line: in
         if SAVE_RECEPTOR:
             DB.save_receptor(receptor_file = RECEPTOR_FILE)
         print("\nReceptor successfully saved to the database.")
-
-        DB.finalize_write()
 
         total_time = time.time() - start_time
         print(f"\nTotal processing time: {total_time:.2f}s")
@@ -490,16 +459,30 @@ def main() -> None:
         # Declare the receptor file as a global variable so that it's accessible.
         global RECEPTOR_FILE
         global GRID_MAP_FILE
+
+        # Fetch the number of NVIDIA GPUs on the system.
+        NUM_GPUS = get_gpu_count()
+        global NUM_GPUS_USED
+        NUM_GPUS_USED = NUM_GPUS # By default uses all GPUs on the system by setting NUM_GPUS_USED = NUM_GPUS.
+
         # Fetch and prepare the receptor structure based on the PDB ID.
         RECEPTOR_FILE, GRID_MAP_FILE = receptor_prep(RECEPTOR_PDB)
+
+        # Case for already prepared receptor and grid map files
         #RECEPTOR_FILE = "9F6A_prepared.pdbqt"
+        #GRID_MAP_FILE = "9F6A_prepared.maps.fld"
 
         # Process all batches and add docking results to Ringtail database.
         process_batches(SMI_FILE, BATCH_SIZE, start_from_line=RESUME_FROM_LINE)
-
-        # Make a filter for the top 1% of docking results.
-        DB.filter(score_percentile=1, bookmark_name="top_1p_results", order_results="e")
         print("\nDocking results successfully added to the Ringtail database.")
+
+        # Filter database for the top 1% of results
+        try:
+            DB.filter(score_percentile=1, bookmark_name="top_1p_results", order_results="e")
+        except Exception as e:
+            print(f"Error filtering the top 1% of results from the database. Check that the database is not empty.")
+            sys.exit(1)
+            
     except KeyboardInterrupt:
         print("\nScript interrupted by user.")
         cleanup()
